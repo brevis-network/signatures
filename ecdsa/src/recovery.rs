@@ -29,9 +29,27 @@ use {
         Signature, SignatureSize,
     },
     elliptic_curve::{
-        generic_array::ArrayLength, ops::Invert, CurveArithmetic, PrimeCurve, Scalar,
+        ff::Field, generic_array::ArrayLength, ops::Invert, CurveArithmetic, NonZeroScalar,
+        PrimeCurve, Scalar,
     },
     signature::digest::Digest,
+};
+
+#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+use {
+    digest::generic_array::GenericArray,
+    elliptic_curve::{
+        bigint::{
+            modular::runtime_mod::{DynResidue, DynResidueParams},
+            ArrayEncoding, Encoding, U256,
+        },
+        sec1::EncodedPoint,
+        Curve, scalar::IsHigh,
+    },
+    pico_patch_libs::{
+        secp256k1::Secp256k1Point, utils::AffinePoint as PicoAffinePoint,
+        utils::WeierstrassAffinePoint,
+    },
 };
 
 /// Recovery IDs, a.k.a. "recid".
@@ -277,12 +295,18 @@ where
 
     /// Recover a [`VerifyingKey`] from the given `prehash` of a message, the
     /// signature over that prehashed message, and a [`RecoveryId`].
+    ///
+    /// This function has been modified to support Pico acceleration for secp256k1 signature verification
+    /// in the context of a zkVM. If the curve is secp256k1 and the prehash is 32 bytes long (indicating a SHA-256 hash),
+    /// the function will use [`VerifyingKey::recover_from_prehash_secp256k1`] to return a precomputed public key.
     #[allow(non_snake_case)]
     pub fn recover_from_prehash(
         prehash: &[u8],
         signature: &Signature<C>,
         recovery_id: RecoveryId,
     ) -> Result<Self> {
+        // `split_scalars` checks that `r`, `s` are non-zero and within scalar range.
+        // `ScalarPrimitive` is guaranteed to be canonical, and `NonZeroScalar` checks value is non-zero.
         let (r, s) = signature.split_scalars();
         let z = <Scalar<C> as Reduce<C::Uint>>::reduce_bytes(&bits2field::<C>(prehash)?);
 
@@ -296,6 +320,16 @@ where
                 None => return Err(Error::new()),
             };
         }
+
+
+        #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+        return Self::recover_from_prehash_zkvm(
+            r,
+            r_bytes.as_slice().try_into().unwrap(),
+            recovery_id.is_y_odd(),
+            s,
+            z,
+        );
         let R = AffinePoint::<C>::decompress(&r_bytes, u8::from(recovery_id.is_y_odd()).into());
 
         if R.is_none().into() {
@@ -314,6 +348,275 @@ where
 
         Ok(vk)
     }
+
+
+    /// Compute the public key from the the signature scalars and prehash.
+    ///
+    /// Note: This function is optimized to be used inside the Pico zkVM.
+    /// We offload the scalar multiplication and certian field ops (invert, sqrt) to the host,
+    /// to be hinted back to the vm, which can then be constrained to be accurate.
+    #[allow(warnings)]
+    #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+    fn recover_from_prehash_zkvm(
+        r: NonZeroScalar<C>,
+        R_x_bytes: [u8; 32],
+        R_y_odd: bool,
+        s: NonZeroScalar<C>,
+        z: <C as CurveArithmetic>::Scalar,
+    ) -> Result<Self> {
+        let (a, b, nqr, base_field_params, curve_id) = ec_params_256_bit::<C>();
+
+        // If the `R_x` value is not canonical, return failure.
+        let R_x = U256::from_be_slice(&R_x_bytes);
+        if &R_x >= base_field_params.modulus() {
+            return Err(Error::new());
+        }
+
+        let R_x = DynResidue::new(&R_x, base_field_params);
+        // The first step of the recovery is to decompress the R point, whose x-coordinate is given
+        // by r_x_bytes.
+        let alpha = R_x * R_x * R_x + (a * R_x) + b;
+
+        // The hook expects the highbit to encode `r_y_is_odd` and the low bits to be curve id.
+        //
+        // The hook should return the inverse of r in the scalar field, which is used to compute u1 and u2.
+        //
+        // If recovering R fails, the hook should return a status code, that lets us constrain this
+        // failure. The only way this fails if alpha is a NQR.
+        let mut buf = [0u8; 65];
+        buf[0] = curve_id | u8::from(R_y_odd) << 7;
+        buf[1..33].copy_from_slice(r.to_repr().as_slice());
+        buf[33..65].copy_from_slice(&alpha.retrieve().to_be_bytes());
+
+        // todo: change the name of this hook
+        pico_patch_libs::io::write(pico_patch_libs::io::FD_ECRECOVER_HOOK, &buf);
+
+        let status: bool = pico_patch_libs::io::read();
+        if !status {
+            // The status indicates that the recovery failed.
+            // So we need to constrain the by proving alpha is non square in the base field.
+            let root_bytes = pico_patch_libs::io::read_vec();
+            let root = DynResidue::new(&U256::from_be_slice(&root_bytes), base_field_params);
+
+            assert!(root * root == alpha * nqr, "Invalid hint for status");
+
+            return Err(Error::new());
+        }
+
+        // The point R in the form [x || y] where x and y are 32 bytes each, big endian.
+        let R_y_bytes = pico_patch_libs::io::read_vec();
+        let R_y = U256::from_be_slice(&R_y_bytes);
+
+        // `R_y` hint should be in canonical form.
+        assert!(
+            &R_y < base_field_params.modulus(),
+            "hint should return canonical value"
+        );
+
+        let R_y = DynResidue::new(&R_y, base_field_params);
+
+        // The y-coordinate must be the sqrt of alpha
+        assert!(R_y * R_y == alpha, "Invalid hint for R_y");
+
+        // Check the lowest bit (corresponding to the 2^0 place), constraining the point by the recovery id.
+        assert_eq!(
+            R_y.retrieve().to_be_bytes().as_slice()[31] & 1 == 1,
+            R_y_odd,
+            "Invalid hint for R_y_odd"
+        );
+
+        // This should be the big endian representation of the inverse of r mod n.
+        let r_inv_bytes = pico_patch_libs::io::read_vec();
+
+        // Ensure the r_inv is correct and canon.
+        //
+        // Here r_inv is modulo the scalar field.
+        let r_inv = C::Scalar::reduce_bytes(GenericArray::from_slice(&r_inv_bytes));
+        assert!(
+            r_inv * *r == <C::Scalar as Field>::ONE,
+            "Invalid hint for r_inv"
+        );
+
+        let u1 = -(r_inv * z);
+        let u2 = r_inv * *s;
+
+        let (u1_bytes, u2_bytes) = (u1.to_repr(), u2.to_repr());
+
+        let u1_le_bits = be_bytes_to_le_bits(u1_bytes.as_slice().try_into().unwrap());
+        let u2_le_bits = be_bytes_to_le_bits(u2_bytes.as_slice().try_into().unwrap());
+        let R_point_bytes: [u8; 64] = {
+            let mut R_point_bytes = [0u8; 64];
+
+            let mut R_x_bytes = R_x_bytes;
+            R_x_bytes.reverse();
+
+            let mut R_y_bytes = R_y_bytes;
+            R_y_bytes.reverse();
+
+            R_point_bytes[0..32].copy_from_slice(&R_x_bytes);
+            R_point_bytes[32..64].copy_from_slice(&R_y_bytes);
+            R_point_bytes
+        };
+
+        let mut pk_le_bytes: [u8; 64] = match curve_id {
+            // secp256k1
+            1 => {
+
+                if s.is_high().into() {
+                    return Err(Error::new());
+                }
+
+                let p = Secp256k1Point::multi_scalar_multiplication(
+                    &u1_le_bits,
+                    Secp256k1Point::new(Secp256k1Point::GENERATOR),
+                    &u2_le_bits,
+                    Secp256k1Point::from_le_bytes(&R_point_bytes),
+                );
+
+                // Return error for result being the point at infinity.
+                if p.unwrap().is_infinity() {
+                    return Err(Error::new());
+                }
+
+                p.unwrap().to_le_bytes()
+                    .try_into()
+                    .expect("a valid point should have 64 bytes")
+            }
+            // 2 => {
+            //     let p = Secp256r1Point::multi_scalar_multiplication(
+            //         &u1_le_bits,
+            //         Secp256r1Point::new(Secp256r1Point::GENERATOR),
+            //         &u2_le_bits,
+            //         Secp256r1Point::from_le_bytes(&R_point_bytes),
+            //     );
+            //
+            //     // Return error for result being the point at infinity.
+            //     if p.is_infinity() {
+            //         return Err(Error::new());
+            //     }
+            //
+            //     p.to_le_bytes()
+            //         .try_into()
+            //         .expect("a valid point should have 64 bytes")
+            // }
+            _ => unimplemented!(),
+        };
+
+        // Convert the point to big endian.
+        let pk_bytes = {
+            let (x, y) = pk_le_bytes.split_at_mut(32);
+
+            x.reverse();
+            y.reverse();
+
+            let mut be_bytes = [0u8; 64];
+            be_bytes[0..32].copy_from_slice(&x);
+            be_bytes[32..].copy_from_slice(&y);
+
+            be_bytes
+        };
+
+        let encoded_point =
+            EncodedPoint::<C>::from_untagged_bytes(GenericArray::from_slice(&pk_bytes));
+
+        let affine = AffinePoint::<C>::from_encoded_point(&encoded_point)
+            .into_option()
+            .unwrap();
+
+        Ok(Self::from_affine(affine)?)
+    }
+}
+
+/// Convert big-endian bytes with the most significant bit first to little-endian bytes with the least significant bit first.
+#[inline]
+#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+fn be_bytes_to_le_bits(be_bytes: &[u8; 32]) -> [bool; 256] {
+    let mut bits = [false; 256];
+    // Reverse the byte order to little-endian.
+    for (i, &byte) in be_bytes.iter().rev().enumerate() {
+        for j in 0..8 {
+            // Flip the bit order so the least significant bit is now the first bit of the chunk.
+            bits[i * 8 + j] = ((byte >> j) & 1) == 1;
+        }
+    }
+    bits
+}
+
+#[cfg(target_os = "zkvm")]
+type ECParams = (
+    DynResidue<8>,
+    DynResidue<8>,
+    DynResidue<8>,
+    DynResidueParams<8>,
+    u8,
+);
+
+#[inline]
+#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+fn ec_params_256_bit<C: Curve>() -> ECParams {
+    // 3 is the non-quadratic residue of the base field of secp256k1 and secp256r1.
+    const NQR: [u8; 32] = {
+        let mut nqr = [0; 32];
+        nqr[31] = 3;
+        nqr
+    };
+
+    // Reference: https://en.bitcoin.it/wiki/Secp256k1.
+    // This is the order of the elliptic curve group.
+    const SECP256K1_ORDER: [u8; 32] =
+        hex_literal::hex!("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEBAAEDCE6AF48A03BBFD25E8CD0364141");
+    const SECP256K1_BASE_FIELD_ORDER: [u8; 32] =
+        hex_literal::hex!("FFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFFEFFFFFC2F");
+    // SECP256K1_A
+    const SECP256K1_A: [u8; 32] = [0; 32];
+    // SECP256K1_B
+    const SECP256K1_B: [u8; 32] = {
+        let mut b = [0u8; 32];
+        b[31] = 7;
+        b
+    };
+
+    // Reference: https://neuromancer.sk/std/secg/secp256r1.
+    // This is the order of the elliptic curve group.
+    const SECP256R1_ORDER: [u8; 32] =
+        hex_literal::hex!("FFFFFFFF00000000FFFFFFFFFFFFFFFFBCE6FAADA7179E84F3B9CAC2FC632551");
+    const SECP256R1_BASE_FIELD_ORDER: [u8; 32] =
+        hex_literal::hex!("ffffffff00000001000000000000000000000000ffffffffffffffffffffffff");
+    // SECP256R1_A
+    const SECP256R1_A: [u8; 32] =
+        hex_literal::hex!("ffffffff00000001000000000000000000000000fffffffffffffffffffffffc");
+    // SECP256R1_B
+    const SECP256R1_B: [u8; 32] =
+        hex_literal::hex!("5ac635d8aa3a93e7b3ebbd55769886bc651d06b0cc53b0f63bce3c3e27d2604b");
+
+    let a;
+    let b;
+    let base_field_params;
+    let curve_id;
+
+    if C::ORDER.to_be_byte_array().as_slice() == SECP256K1_ORDER.as_slice() {
+        base_field_params = DynResidueParams::new(&U256::from_be_bytes(SECP256K1_BASE_FIELD_ORDER));
+
+        a = DynResidue::new(&U256::from_be_bytes(SECP256K1_A), base_field_params);
+        b = DynResidue::new(&U256::from_be_bytes(SECP256K1_B), base_field_params);
+        curve_id = 1;
+    } else if C::ORDER.to_be_byte_array().as_slice() == SECP256R1_ORDER.as_slice() {
+        base_field_params = DynResidueParams::new(&U256::from_be_bytes(SECP256R1_BASE_FIELD_ORDER));
+
+        a = DynResidue::new(&U256::from_be_bytes(SECP256R1_A), base_field_params);
+        b = DynResidue::new(&U256::from_be_bytes(SECP256R1_B), base_field_params);
+        curve_id = 2;
+    } else {
+        unimplemented!("Unsupported curve");
+    };
+
+    (
+        a,
+        b,
+        DynResidue::new(&U256::from_be_bytes(NQR), base_field_params),
+        base_field_params,
+        curve_id,
+    )
 }
 
 #[cfg(test)]
