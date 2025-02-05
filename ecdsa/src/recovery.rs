@@ -323,13 +323,16 @@ where
 
 
         #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
-        return Self::recover_from_prehash_zkvm(
-            r,
-            r_bytes.as_slice().try_into().unwrap(),
-            recovery_id.is_y_odd(),
-            s,
-            z,
-        );
+        let params = ec_params_256_bit::<C>();
+        #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+        assert!(r_bytes.as_slice().len() == 32);
+        // specialize secp256k1
+        #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+        return if params.4 == 1 {
+            Self::recover_from_prehash_secp256k1(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
+        } else {
+            Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
+        };
         let R = AffinePoint::<C>::decompress(&r_bytes, u8::from(recovery_id.is_y_odd()).into());
 
         if R.is_none().into() {
@@ -357,14 +360,15 @@ where
     /// to be hinted back to the vm, which can then be constrained to be accurate.
     #[allow(warnings)]
     #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
-    fn recover_from_prehash_zkvm(
+    fn recover_from_prehash_secp256k1(
         r: NonZeroScalar<C>,
-        R_x_bytes: [u8; 32],
+        R_x_bytes: &[u8],
         R_y_odd: bool,
         s: NonZeroScalar<C>,
         z: <C as CurveArithmetic>::Scalar,
+        params: &ECParams,
     ) -> Result<Self> {
-        let (a, b, nqr, base_field_params, curve_id) = ec_params_256_bit::<C>();
+        let (a, _, nqr, base_field_params, curve_id) = params;
 
         // If the `R_x` value is not canonical, return failure.
         let R_x = U256::from_be_slice(&R_x_bytes);
@@ -372,7 +376,7 @@ where
             return Err(Error::new());
         }
 
-        let R_x_le = be_bytes_to_le_u32(&R_x_bytes);
+        let R_x_le = R_x.to_words();
         // Compute alpha = R_x^3 + a * R_x + b using system calls
         let mut alpha_le = R_x_le;
         unsafe {
@@ -388,16 +392,9 @@ where
             syscall_secp256k1_fp_addmod(alpha_le.as_mut_ptr(), B_le.as_ptr());     // add b
         }
 
-        let mut alpha_bytes = Vec::with_capacity(32);
-
-        for &value in alpha_le.iter() {
-            alpha_bytes.extend_from_slice(&value.to_le_bytes());
-        }
-
         // The first step of the recovery is to decompress the R point, whose x-coordinate is given
         // by r_x_bytes.
-        let alpha = U256::from_le_slice(&alpha_bytes);
-        let alpha_be = alpha.to_be_bytes();
+        let alpha = U256::from_words(alpha_le);
 
         // The hook expects the highbit to encode `r_y_is_odd` and the low bits to be curve id.
         //
@@ -405,23 +402,29 @@ where
         //
         // If recovering R fails, the hook should return a status code, that lets us constrain this
         // failure. The only way this fails if alpha is a NQR.
-        let mut buf = [0u8; 65];
-        buf[0] = curve_id | u8::from(R_y_odd) << 7;
-        buf[1..33].copy_from_slice(r.to_repr().as_slice());
-        buf[33..65].copy_from_slice(&alpha_be);
+        //
+        // the sending and formatting of the hook can be unconstrained, as all of alpha, curve_id,
+        // R_y_odd, and r are known and constrained by the zkvm at this point
+        pico_patch_libs::unconstrained! {
+            let alpha_be = alpha.to_be_bytes();
+            let mut buf = [0u8; 65];
+            buf[0] = curve_id | u8::from(R_y_odd) << 7;
+            buf[1..33].copy_from_slice(r.to_repr().as_slice());
+            buf[33..65].copy_from_slice(&alpha_be);
 
-        // todo: change the name of this hook
-        pico_patch_libs::io::write(pico_patch_libs::io::FD_ECRECOVER_HOOK, &buf);
+            // todo: change the name of this hook
+            pico_patch_libs::io::write(pico_patch_libs::io::FD_ECRECOVER_HOOK, &buf);
+        }
 
         let status: bool = pico_patch_libs::io::read();
         if !status {
             // The status indicates that the recovery failed.
             // So we need to constrain the by proving alpha is non square in the base field.
             let root_bytes = pico_patch_libs::io::read_vec();
-            let root = DynResidue::new(&U256::from_be_slice(&root_bytes), base_field_params);
+            let root = DynResidue::new(&U256::from_be_slice(&root_bytes), *base_field_params);
 
-            let mut nqr_le_u32 = be_bytes_to_le_u32(&DynResidue::retrieve(&nqr).to_be_bytes());
-            let mut root = be_bytes_to_le_u32(&DynResidue::retrieve(&root).to_be_bytes());
+            let mut nqr_le_u32 = nqr.retrieve().to_words();
+            let root = root.retrieve().to_words();
 
             let mut root_sq = root;
 
@@ -444,7 +447,7 @@ where
             "hint should return canonical value"
         );
 
-        let mut R_y_le_u32 = be_bytes_to_le_u32(&R_y_bytes.clone().try_into().unwrap());
+        let mut R_y_le_u32 = R_y.to_words();
         let mut R_y_sq =  R_y_le_u32;
 
         // The y-coordinate must be the sqrt of alpha
@@ -453,9 +456,10 @@ where
         }
         assert!(R_y_sq == alpha_le, "Invalid hint for R_y");
 
-        // Check the lowest bit (corresponding to the 2^0 place), constraining the point by the recovery id.
+        // Check the lowest bit (corresponding to the 2^0 place), constraining the point by the
+        // recovery id
         assert_eq!(
-            R_y.to_be_bytes().as_slice()[31] & 1 == 1,
+            R_y_bytes[31] & 1 == 1,
             R_y_odd,
             "Invalid hint for R_y_odd"
         );
@@ -482,21 +486,16 @@ where
         let R_point_bytes: [u8; 64] = {
             let mut R_point_bytes = [0u8; 64];
 
-            let mut R_x_bytes = R_x_bytes;
-            R_x_bytes.reverse();
-
-            let mut R_y_bytes = R_y_bytes;
-            R_y_bytes.reverse();
-
-            R_point_bytes[0..32].copy_from_slice(&R_x_bytes);
-            R_point_bytes[32..64].copy_from_slice(&R_y_bytes);
+            // Reversing y || x as encoded in BE is x || y encoded in LE
+            R_point_bytes[0..32].copy_from_slice(&R_y_bytes);
+            R_point_bytes[32..64].copy_from_slice(&R_x_bytes);
+            R_point_bytes.reverse();
             R_point_bytes
         };
 
         let mut pk_le_bytes: [u8; 64] = match curve_id {
             // secp256k1
             1 => {
-
                 if s.is_high().into() {
                     return Err(Error::new());
                 }
@@ -517,6 +516,141 @@ where
                     .try_into()
                     .expect("a valid point should have 64 bytes")
             }
+            _ => unreachable!(),
+        };
+
+        // Convert the point to big endian.
+        let pk_bytes = {
+            let (x, y) = pk_le_bytes.split_at_mut(32);
+
+            x.reverse();
+            y.reverse();
+
+            let mut be_bytes = [0u8; 64];
+            be_bytes[0..32].copy_from_slice(&x);
+            be_bytes[32..].copy_from_slice(&y);
+
+            be_bytes
+        };
+
+        let encoded_point =
+            EncodedPoint::<C>::from_untagged_bytes(GenericArray::from_slice(&pk_bytes));
+
+        let affine = AffinePoint::<C>::from_encoded_point(&encoded_point)
+            .into_option()
+            .unwrap();
+
+        Ok(Self::from_affine(affine)?)
+    }
+
+    #[allow(warnings)]
+    #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+    fn recover_from_prehash_generic(
+        r: NonZeroScalar<C>,
+        R_x_bytes: &[u8],
+        R_y_odd: bool,
+        s: NonZeroScalar<C>,
+        z: <C as CurveArithmetic>::Scalar,
+        params: &ECParams,
+    ) -> Result<Self> {
+        let (a, b, nqr, base_field_params, curve_id) = ec_params_256_bit::<C>();
+
+        // If the `R_x` value is not canonical, return failure.
+        let R_x = U256::from_be_slice(&R_x_bytes);
+        if &R_x >= base_field_params.modulus() {
+            return Err(Error::new());
+        }
+
+        let R_x = DynResidue::new(&R_x, base_field_params);
+        // The first step of the recovery is to decompress the R point, whose x-coordinate is given
+        // by r_x_bytes.
+        let alpha = R_x * R_x * R_x + (a * R_x) + b;
+
+        // The hook expects the highbit to encode `r_y_is_odd` and the low bits to be curve id.
+        //
+        // The hook should return the inverse of r in the scalar field, which is used to compute u1 and u2.
+        //
+        // If recovering R fails, the hook should return a status code, that lets us constrain this
+        // failure. The only way this fails if alpha is a NQR.
+        let mut buf = [0u8; 65];
+        buf[0] = curve_id | u8::from(R_y_odd) << 7;
+        buf[1..33].copy_from_slice(r.to_repr().as_slice());
+        buf[33..65].copy_from_slice(&alpha.retrieve().to_be_bytes());
+
+        // todo: change the name of this hook
+        pico_patch_libs::io::write(pico_patch_libs::io::FD_ECRECOVER_HOOK, &buf);
+
+        let status: bool = pico_patch_libs::io::read();
+        if !status {
+            // The status indicates that the recovery failed.
+            // So we need to constrain the by proving alpha is non square in the base field.
+            let root_bytes = pico_patch_libs::io::read_vec();
+            let root = DynResidue::new(&U256::from_be_slice(&root_bytes), base_field_params);
+
+            assert!(root * root == alpha * nqr, "Invalid hint for status");
+
+            return Err(Error::new());
+        }
+
+        // The point R in the form [x || y] where x and y are 32 bytes each, big endian.
+        let R_y_bytes = pico_patch_libs::io::read_vec();
+        let R_y = U256::from_be_slice(&R_y_bytes);
+
+        // `R_y` hint should be in canonical form.
+        assert!(
+            &R_y < base_field_params.modulus(),
+            "hint should return canonical value"
+        );
+
+        let R_y = DynResidue::new(&R_y, base_field_params);
+
+        // The y-coordinate must be the sqrt of alpha
+        assert!(R_y * R_y == alpha, "Invalid hint for R_y");
+
+        // Check the lowest bit (corresponding to the 2^0 place), constraining the point by the recovery id.
+        assert_eq!(
+            R_y.retrieve().to_be_bytes().as_slice()[31] & 1 == 1,
+            R_y_odd,
+            "Invalid hint for R_y_odd"
+        );
+
+        // This should be the big endian representation of the inverse of r mod n.
+        let r_inv_bytes = pico_patch_libs::io::read_vec();
+
+        // Ensure the r_inv is correct and canon.
+        //
+        // Here r_inv is modulo the scalar field.
+        let r_inv = C::Scalar::reduce_bytes(GenericArray::from_slice(&r_inv_bytes));
+        assert!(
+            r_inv * *r == <C::Scalar as Field>::ONE,
+            "Invalid hint for r_inv"
+        );
+
+        let u1 = -(r_inv * z);
+        let u2 = r_inv * *s;
+
+        let (u1_bytes, u2_bytes) = (u1.to_repr(), u2.to_repr());
+
+        let u1_le_bits = be_bytes_to_le_bits(u1_bytes.as_slice().try_into().unwrap());
+        let u2_le_bits = be_bytes_to_le_bits(u2_bytes.as_slice().try_into().unwrap());
+        let R_point_bytes: [u8; 64] = {
+            let mut R_point_bytes = [0u8; 64];
+
+            let mut R_x_bytes_le = [0; 32];
+            R_x_bytes_le.copy_from_slice(&R_x_bytes);
+            R_x_bytes_le.reverse();
+
+            let mut R_y_bytes = R_y_bytes;
+            R_y_bytes.reverse();
+
+            R_point_bytes[0..32].copy_from_slice(&R_x_bytes_le);
+            R_point_bytes[32..64].copy_from_slice(&R_y_bytes);
+            R_point_bytes
+        };
+
+        let mut pk_le_bytes: [u8; 64] = match curve_id {
+            // secp256k1
+            1 => unreachable!("specialized secp256k1"),
             // 2 => {
             //     let p = Secp256r1Point::multi_scalar_multiplication(
             //         &u1_le_bits,
