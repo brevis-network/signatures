@@ -394,8 +394,7 @@ where
 
         // The first step of the recovery is to decompress the R point, whose x-coordinate is given
         // by r_x_bytes.
-        let alpha = U256::from_words(alpha_le);
-
+        //
         // The hook expects the highbit to encode `r_y_is_odd` and the low bits to be curve id.
         //
         // The hook should return the inverse of r in the scalar field, which is used to compute u1 and u2.
@@ -406,6 +405,7 @@ where
         // the sending and formatting of the hook can be unconstrained, as all of alpha, curve_id,
         // R_y_odd, and r are known and constrained by the zkvm at this point
         pico_patch_libs::unconstrained! {
+            let alpha = U256::from_words(alpha_le);
             let alpha_be = alpha.to_be_bytes();
             let mut buf = [0u8; 65];
             buf[0] = curve_id | u8::from(R_y_odd) << 7;
