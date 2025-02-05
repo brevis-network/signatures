@@ -48,7 +48,7 @@ use {
     },
     pico_patch_libs::{
         secp256k1::Secp256k1Point, utils::AffinePoint as PicoAffinePoint,
-        utils::WeierstrassAffinePoint,
+        utils::WeierstrassAffinePoint, syscall_secp256k1_fp_addmod, syscall_secp256k1_fp_mulmod,
     },
 };
 
@@ -372,10 +372,32 @@ where
             return Err(Error::new());
         }
 
-        let R_x = DynResidue::new(&R_x, base_field_params);
+        let R_x_le = be_bytes_to_le_u32(&R_x_bytes);
+        // Compute alpha = R_x^3 + a * R_x + b using system calls
+        let mut alpha_le = R_x_le;
+        unsafe {
+            // R_x^2
+            syscall_secp256k1_fp_mulmod(alpha_le.as_mut_ptr(), R_x_le.as_ptr());
+
+            // R_x^3
+            syscall_secp256k1_fp_mulmod(alpha_le.as_mut_ptr(), R_x_le.as_ptr());
+
+            // TODO: alpha = R_x^3 + a * R_x + b
+            // syscall_secp256k1_fp_mulmod(a_le.as_mut_ptr(), R_x_le.as_ptr());  // a * R_x
+            // syscall_secp256k1_fp_addmod(alpha.as_mut_ptr(), a_le.as_ptr());     // add b
+            syscall_secp256k1_fp_addmod(alpha_le.as_mut_ptr(), B_le.as_ptr());     // add b
+        }
+
+        let mut alpha_bytes = Vec::with_capacity(32);
+
+        for &value in alpha_le.iter() {
+            alpha_bytes.extend_from_slice(&value.to_le_bytes());
+        }
+
         // The first step of the recovery is to decompress the R point, whose x-coordinate is given
         // by r_x_bytes.
-        let alpha = R_x * R_x * R_x + (a * R_x) + b;
+        let alpha = U256::from_le_slice(&alpha_bytes);
+        let alpha_be = alpha.to_be_bytes();
 
         // The hook expects the highbit to encode `r_y_is_odd` and the low bits to be curve id.
         //
@@ -386,7 +408,7 @@ where
         let mut buf = [0u8; 65];
         buf[0] = curve_id | u8::from(R_y_odd) << 7;
         buf[1..33].copy_from_slice(r.to_repr().as_slice());
-        buf[33..65].copy_from_slice(&alpha.retrieve().to_be_bytes());
+        buf[33..65].copy_from_slice(&alpha_be);
 
         // todo: change the name of this hook
         pico_patch_libs::io::write(pico_patch_libs::io::FD_ECRECOVER_HOOK, &buf);
@@ -398,7 +420,16 @@ where
             let root_bytes = pico_patch_libs::io::read_vec();
             let root = DynResidue::new(&U256::from_be_slice(&root_bytes), base_field_params);
 
-            assert!(root * root == alpha * nqr, "Invalid hint for status");
+            let mut nqr_le_u32 = be_bytes_to_le_u32(&DynResidue::retrieve(&nqr).to_be_bytes());
+            let mut root = be_bytes_to_le_u32(&DynResidue::retrieve(&root).to_be_bytes());
+
+            let mut root_sq = root;
+
+            unsafe {
+                syscall_secp256k1_fp_mulmod(root_sq.as_mut_ptr(), root.as_ptr());
+                syscall_secp256k1_fp_mulmod(nqr_le_u32.as_mut_ptr(), alpha_le.as_ptr());
+            }
+            assert_eq!(root_sq, nqr_le_u32, "Invalid hint for status");
 
             return Err(Error::new());
         }
@@ -413,14 +444,18 @@ where
             "hint should return canonical value"
         );
 
-        let R_y = DynResidue::new(&R_y, base_field_params);
+        let mut R_y_le_u32 = be_bytes_to_le_u32(&R_y_bytes.clone().try_into().unwrap());
+        let mut R_y_sq =  R_y_le_u32;
 
         // The y-coordinate must be the sqrt of alpha
-        assert!(R_y * R_y == alpha, "Invalid hint for R_y");
+        unsafe {
+            syscall_secp256k1_fp_mulmod(R_y_sq.as_mut_ptr(), R_y_le_u32.as_ptr());
+        }
+        assert!(R_y_sq == alpha_le, "Invalid hint for R_y");
 
         // Check the lowest bit (corresponding to the 2^0 place), constraining the point by the recovery id.
         assert_eq!(
-            R_y.retrieve().to_be_bytes().as_slice()[31] & 1 == 1,
+            R_y.to_be_bytes().as_slice()[31] & 1 == 1,
             R_y_odd,
             "Invalid hint for R_y_odd"
         );
@@ -526,6 +561,30 @@ where
         Ok(Self::from_affine(affine)?)
     }
 }
+
+#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+static B_le: [u32; 8] = [7, 0, 0, 0, 0, 0, 0, 0];
+
+#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+fn be_bytes_to_le_u32(input: &[u8; 32]) -> [u32; 8] {
+    let mut reversed = [0u8; 32];
+    reversed.copy_from_slice(input);
+    reversed.reverse();
+
+    let mut result = [0u32; 8];
+    for i in 0..8 {
+        let start = i * 4;
+        result[i] = u32::from_le_bytes([
+            reversed[start],
+            reversed[start + 1],
+            reversed[start + 2],
+            reversed[start + 3],
+        ]);
+    }
+    result
+}
+
+
 
 /// Convert big-endian bytes with the most significant bit first to little-endian bytes with the least significant bit first.
 #[inline]
