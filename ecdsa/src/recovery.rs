@@ -328,11 +328,12 @@ where
         assert!(r_bytes.as_slice().len() == 32);
         // specialize secp256k1
         #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
-        return if params.4 == 1 {
-            Self::recover_from_prehash_secp256k1(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
-        } else {
-            Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
-        };
+        //return if params.4 == 1 {
+        //    Self::recover_from_prehash_secp256k1(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
+        //} else {
+        //    Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
+        //};
+        return Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params);
         let R = AffinePoint::<C>::decompress(&r_bytes, u8::from(recovery_id.is_y_odd()).into());
 
         if R.is_none().into() {
@@ -650,7 +651,27 @@ where
 
         let mut pk_le_bytes: [u8; 64] = match curve_id {
             // secp256k1
-            1 => unreachable!("specialized secp256k1"),
+            1 => {
+                if s.is_high().into() {
+                    return Err(Error::new());
+                }
+
+                let p = Secp256k1Point::multi_scalar_multiplication(
+                    &u1_le_bits,
+                    Secp256k1Point::new(Secp256k1Point::GENERATOR),
+                    &u2_le_bits,
+                    Secp256k1Point::from_le_bytes(&R_point_bytes),
+                );
+
+                // Return error for result being the point at infinity.
+                if p.unwrap().is_infinity() {
+                    return Err(Error::new());
+                }
+
+                p.unwrap().to_le_bytes()
+                    .try_into()
+                    .expect("a valid point should have 64 bytes")
+            }
             // 2 => {
             //     let p = Secp256r1Point::multi_scalar_multiplication(
             //         &u1_le_bits,
