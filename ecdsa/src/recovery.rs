@@ -322,10 +322,10 @@ where
         }
 
 
-        #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
-        let params = ec_params_256_bit::<C>();
-        #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
-        assert!(r_bytes.as_slice().len() == 32);
+        //#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+        //let params = ec_params_256_bit::<C>();
+        //#[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
+        //assert!(r_bytes.as_slice().len() == 32);
         // specialize secp256k1
         #[cfg(all(target_os = "zkvm", target_vendor = "risc0"))]
         //return if params.4 == 1 {
@@ -333,7 +333,7 @@ where
         //} else {
         //    Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params)
         //};
-        return Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z, &params);
+        return Self::recover_from_prehash_generic(r, &r_bytes, recovery_id.is_y_odd(), s, z);
         let R = AffinePoint::<C>::decompress(&r_bytes, u8::from(recovery_id.is_y_odd()).into());
 
         if R.is_none().into() {
@@ -552,7 +552,6 @@ where
         R_y_odd: bool,
         s: NonZeroScalar<C>,
         z: <C as CurveArithmetic>::Scalar,
-        params: &ECParams,
     ) -> Result<Self> {
         let (a, b, nqr, base_field_params, curve_id) = ec_params_256_bit::<C>();
 
