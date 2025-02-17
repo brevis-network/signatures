@@ -429,8 +429,8 @@ dependencies = [
 
 [[package]]
 name = "pico-patch-libs"
-version = "0.1.0"
-source = "git+https://github.com/brevis-network/brevis-vm.git?branch=update-patches#bb5815da95e153803d79f48131d7a9bd42a5d571"
+version = "1.0.0"
+source = "git+https://github.com/brevis-network/pico.git#32ff33349f53a8697e9013629b4533b549ff2840"
 dependencies = [
  "bincode",
  "serde",

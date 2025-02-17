@@ -30,7 +30,7 @@ cfg-if = "1.0"
 hex-literal = "0.4"
 
 [target.'cfg(all(target_os = "zkvm", target_vendor = "risc0"))'.dependencies]
-pico-patch-libs = { git = "https://github.com/brevis-network/brevis-vm.git" }
+pico-patch-libs = { git = "https://github.com/brevis-network/pico.git" }
 
 
 [dev-dependencies]
